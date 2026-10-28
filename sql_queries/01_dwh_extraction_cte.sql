@@ -1,12 +1,12 @@
 -- ============================================================================
 -- PROJECT: Fraud Volume Reduction
 -- EXTENSION: 01_dwh_extraction_cte.sql
--- DESCRIPTION: Выявление мошеннических схем (Smurfing и Mule-аккаунты) 
---              в DWH с использованием CTE, Window Functions и сложных JOIN.
+-- DESCRIPTION: Detecting fraudulent schemes (Smurfing and Mule Accounts) 
+--              in DWH using CTEs, Window Functions, and complex JOINs.
 -- ============================================================================
 
 WITH transaction_cleansing AS (
-    -- Шаг 1: Извлекаем транзакции из DWH, очищаем и нормализуем типы данных
+    -- Step 1: Extract transactions from DWH, clean and normalize data types
     SELECT 
         tx.transaction_id,
         tx.client_id,
@@ -15,9 +15,9 @@ WITH transaction_cleansing AS (
         tx.transaction_time,
         tx.amount,
         tx.currency,
-        -- Переводим суммы в единую валюту (например, EUR, как в международном CV)
+        -- Convert transactional amounts to a unified currency baseline (EUR)
         CASE 
-            WHEN tx.currency = 'RUB' THEN tx.amount / 95.0 -- условный курс
+            WHEN tx.currency = 'RUB' THEN tx.amount / 95.0 
             WHEN tx.currency = 'KZT' THEN tx.amount / 500.0
             ELSE tx.amount 
         END AS amount_eur,
@@ -26,35 +26,35 @@ WITH transaction_cleansing AS (
         tx.ip_address
     FROM dwh.core_transactions tx
     WHERE tx.status = 'SUCCESS'
-      -- Анализируем исторический массив за критический период атак
+      -- Analyze historical dataset for critical attack periods
       AND tx.transaction_time BETWEEN '2025-01-01' AND '2025-12-31'
 ),
 
 velocity_metrics AS (
-    -- Шаг 2: Расчет поведенческих метрик во времени с помощью оконных функций
+    -- Step 2: Calculate time-series behavioral metrics using window functions
     SELECT 
         tc.*,
-        -- Считаем количество транзакций клиента за последние 10 минут (веерная рассылка)
+        -- Track the number of transfers within rolling 10-minute windows (Smurfing check)
         COUNT(tc.transaction_id) OVER(
             PARTITION BY tc.client_id 
             ORDER BY tc.transaction_time 
             RANGE BETWEEN INTERVAL '10 MINUTES' PRECEDING AND CURRENT ROW
         ) AS tx_count_10m,
         
-        -- Считаем кумулятивную сумму переводов клиента за последние 24 часа
+        -- Compute cumulative transfer volumes over rolling 24-hour periods
         SUM(tc.amount_eur) OVER(
             PARTITION BY tc.client_id 
             ORDER BY tc.transaction_time 
             RANGE BETWEEN INTERVAL '24 HOURS' PRECEDING AND CURRENT ROW
         ) AS total_amount_24h,
         
-        -- Вычисляем средний чек клиента за прошлый месяц для выявления аномальных всплесков
+        -- Capture baseline deviations from the immediate historical transaction
         LAG(tc.amount_eur, 1) OVER(
             PARTITION BY tc.client_id 
             ORDER BY tc.transaction_time
         ) AS previous_tx_amount,
         
-        -- Проверяем смену устройств (уникальные девайсы на одного клиента)
+        -- Flag hardware token rotation (unique devices bound to a single client)
         DENSE_RANK() OVER(
             PARTITION BY tc.client_id 
             ORDER BY tc.device_id
@@ -63,20 +63,20 @@ velocity_metrics AS (
 ),
 
 mule_accounts_detection AS (
-    -- Шаг 3: Выявляем транзитные счета (Mule Accounts), куда деньги приходят и тут же уходят
+    -- Step 3: Isolate suspicious transit nodes (Mule Accounts with rapid routing)
     SELECT 
         v.account_number_to AS suspected_mule_account,
         COUNT(DISTINCT v.client_id) AS unique_senders,
         SUM(v.amount_eur) AS total_inbound_volume,
         AVG(v.amount_eur) AS avg_inbound_tx
     FROM velocity_metrics v
-    WHERE v.mcc IN ('6011', '6012') -- Снятие наличных, финансовые институты (типичный вывод)
+    WHERE v.mcc IN ('6011', '6012') -- Cash outs and rapid financial routing categories
     GROUP BY v.account_number_to
-    HAVING COUNT(DISTINCT v.client_id) >= 3 -- 3 и более разных отправителей на один счет за период
-       AND SUM(v.amount_eur) > 5000         -- Крупный объем транзита
+    HAVING COUNT(DISTINCT v.client_id) >= 3 -- 3+ distinct originators sending funds to 1 target node
+       AND SUM(v.amount_eur) > 5000         -- High-volume velocity traffic
 )
 
--- Шаг 4: Финальная склейка и скоринг для выгрузки в антифрод-мониторинг
+-- Step 4: Final consolidation and real-time behavioral scoring output
 SELECT 
     vm.transaction_id,
     vm.client_id,
@@ -86,7 +86,7 @@ SELECT
     vm.total_amount_24h,
     vm.ip_address,
     cl.risk_segment AS current_client_risk_segment,
-    -- Присваиваем флаг подозрительной транзакции на основе агрегированных факторов
+    -- Evaluate risk flags based on compiled transactional aggregates
     CASE 
         WHEN ma.suspected_mule_account IS NOT NULL THEN 'CRITICAL: Target Mule Account Detected'
         WHEN vm.tx_count_10m > 5 AND vm.amount_eur < 150 THEN 'HIGH: Smurfing Pattern'
@@ -95,9 +95,9 @@ SELECT
     END AS fraud_alert_level
 
 FROM velocity_metrics vm
--- Джойним справочник клиентов для проверки их риск-профиля
+-- Join corporate directory to validate active client profiles
 INNER JOIN dwh.client_profiles cl ON vm.client_id = cl.client_id
--- Левое соединение с нашей таблицей выявленных дроп-счетов
+-- Merge mapped transit mule entities for real-time alerting
 LEFT JOIN mule_accounts_detection ma ON vm.account_number_to = ma.suspected_mule_account
 WHERE cl.is_active = TRUE
 ORDER BY vm.transaction_time DESC
